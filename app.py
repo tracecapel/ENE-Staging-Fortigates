@@ -9,6 +9,8 @@ import os
 import time
 import fortigate_api
 from dotenv import load_dotenv
+import logging
+from paramiko.util import log_to_file
 
 
 save_dir = os.path.join("C:/Users/tracecapel/Downloads/Staged")
@@ -32,6 +34,8 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 MSOD_USERNAME = os.getenv("MSOD_USERNAME")
 MSOD_PASSWORD = os.getenv("MSOD_PASSWORD")
+MSOD_PASSWORD_TWO = os.getenv("MSOD_PASSWORD_TWO")
+OLD_PASSWORD = os.getenv("OLD_PASSWORD")
 
 
 # Runs a command, will busy wait until the hostname is sent back (indicating ready for next command)
@@ -45,7 +49,9 @@ MSOD_PASSWORD = os.getenv("MSOD_PASSWORD")
 def run_command(command, shell, hostname, log):
 
     # Send the command to the shell
-    shell.send(command + "\n")
+    shell.sendall(command + "\n")
+
+    return
 
     # Capture the shell output- this will be what the shell reads back after the command is executed, ie "FortiGate-40F #"
     output = ""
@@ -130,28 +136,38 @@ def submit():
             # Paramiko client- this is like an invisible MobaX or another SSH client
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            admin_worked = False
 
             # Attempt to connect- with admin and mandolorian (like you do normally during staging)
             try:
+                print("Trying to connect with admin")
 
                 ssh.connect(
-                    hostname=ip,
-                    username=ADMIN_USERNAME,
-                    password=ADMIN_PASSWORD,
-                    timeout=15,
-                    banner_timeout=15,
-                    auth_timeout=15,
+                    hostname=ip, username=ADMIN_USERNAME, password=ADMIN_PASSWORD
                 )
+
+                admin_worked = True
+
             except Exception as exc:
-                print("Connection failed:", exc)
-                ssh.close()
-                return "Connection failed"
+
+                print(
+                    "admin connect failed: "
+                    + str(exc)
+                    + " Trying default admin credentials"
+                )
+
+            if not admin_worked:
+                try:
+                    ssh.connect(
+                        hostname=ip, username=MSOD_USERNAME, password=MSOD_PASSWORD
+                    )
+                except:
+                    return "Auth failed"
 
             #'test' the connection, if we can use get sys status, we are good.
             try:
-                stdin, stdout, stderr = ssh.exec_command(
-                    "get system status", timeout=30
-                )
+
+                stdin, stdout, stderr = ssh.exec_command("get system status")
 
                 # Capture the serial number
                 serial = ""
@@ -172,6 +188,7 @@ def submit():
                         if file is None or not file.filename:
                             return "Invalid File"
 
+                        # Important - prevent malicious file extensions or uploads
                         filename = secure_filename(file.filename)
 
                         if (
@@ -194,16 +211,13 @@ def submit():
                             text += str(byte)
 
                     shell = ssh.invoke_shell()
-                    shell.settimeout(10)
 
                     # Maybe find a more robust way to do this- but this is what "splits" the base config between FT/Config and uses admin/MSOD respectively
-                    split_marker = (
-                        "#!=========== ABOVE THIS LINE IS FOR THE FIELD TECH "
-                        "TO PROVIDE REMOTE ACCESS! ====="
-                    )
+                    split_marker = "ABOVE THIS LINE IS FOR THE FIELD TECH "
 
                     split = text.split(split_marker, 1)
 
+                    # The config didnt split at the marker above
                     if len(split) != 2:
                         return "Invalid base config format"
 
@@ -235,17 +249,23 @@ def submit():
                         encoding="utf-8",
                     )
 
+                    with open(
+                        "Forticloud.txt", "a+", encoding="utf-8"
+                    ) as forticloud_log:
+                        lines = forticloud_log.readlines()
+                        lines.append(eng + " | " + serial + "\n")
+                        forticloud_log.writelines(lines)
+
                     try:
 
                         field_tech_script = split[0]
 
                         ft_conact = ""
-                        ft_conact += "diagnose debug config-error-log clear\n"
 
                         for command in field_tech_script.splitlines():
                             command = command.strip()
 
-                            if command:
+                            if command and not command.__contains__("!"):
                                 ft_conact += str(command + "\n")
 
                         # Change hostname, register in forticloud, update, clear debug config log etc etc... very efficiently written
@@ -259,25 +279,28 @@ def submit():
                         ft_conact += "end\n"
 
                         ft_conact += 'exe fortiguard-log login DL-SEE&O-ENEService@charter.com "&nxjMFBmjiBcTb.%ZJ7r" US DL-SEE&O-ENEService@charter.com\n'
+                        ft_conact += "config system admin\n"
+                        ft_conact += "edit " + '"MSOD_Admin"' + "\n"
 
-                        ft_conact += "exe update-now\n"
-
-                        ft_conact += "edit MSOD_Admin\n"
                         ft_conact += "set password " + MSOD_PASSWORD + "\n"
-                        ft_conact += "next\n"
                         ft_conact += "end\n"
+
+                        # ft_conact += "exe update-now\n"
 
                         # This is where we drop the FT script
                         run_command(ft_conact, shell, hostname, log)
+                        print("Ran field tech script")
 
                         base_config = split[1]
 
                         # Close connection - DO NOT proceed until we successfully close the SSH connection
                         while True:
+                            time.sleep(3)
 
                             try:
 
                                 ssh.close()
+                                print("Closed")
                                 break
                             except Exception:
                                 print("Closed failed... retrying")
@@ -292,9 +315,6 @@ def submit():
                                     hostname=ip,
                                     username=MSOD_USERNAME,
                                     password=MSOD_PASSWORD,
-                                    timeout=15,
-                                    banner_timeout=15,
-                                    auth_timeout=15,
                                 )
 
                                 stdin, stdout, stderr = ssh.exec_command(
@@ -308,9 +328,9 @@ def submit():
                                 if status_output:
                                     break
 
-                            except Exception:
+                            except Exception as e:
 
-                                print("Connection failed, retrying")
+                                print("MSOD Connect failed" + str(e))
 
                         # Get the shell
                         shell = ssh.invoke_shell()
@@ -326,48 +346,30 @@ def submit():
 
                         run_command(config_concat, shell, hostname, log)
 
-                        # Capture any errors from base config
-                        stdin, stdout, stderr = ssh.exec_command(
-                            "diagnose debug config-error-log read", timeout=30
+                        time.sleep(3)
+
+                        ssh.close()
+                        
+                        #Connect a netmiko session - the reason we use netmiko is because it wont paginate output by default (so we can get the full backup from one command!)
+                        fortigate_netmiko_session = {
+                            "device_type": "fortinet",
+                            "host": ip,
+                            "username": MSOD_USERNAME,
+                            "password": MSOD_PASSWORD,
+                            "port": 22,
+                        }
+
+                        netconnect = ConnectHandler(**fortigate_netmiko_session)
+                        netconnect.enable()
+
+                        backup_config = netconnect.send_command(
+                            "show full-configuration", read_timeout=60
                         )
 
-                        error_output = stdout.read().decode("utf-8", errors="replace")
+                        for line in backup_config.splitlines():
+                            log.write(line + "\n")
 
-                        with open(
-                            os.path.join(eng_dir, hostname + "_error_log.txt"),
-                            "w",
-                            encoding="utf-8",
-                        ) as err:
-                            for line in error_output.splitlines():
-                                err.write(line + "\n")
-
-                        # Close connection
-                        ssh.close()
-
-                        # Here we login via netmiko, mainly because it doesent paginate the output from show-full-cofig
-                        try:
-                            fortigate = {
-                                "device_type": "fortinet",
-                                "host": ip,
-                                "username": MSOD_USERNAME,
-                                "password": MSOD_PASSWORD,
-                                "port": 22,
-                            }
-
-                            with ConnectHandler(**fortigate) as netconnect:
-                                backup_config = netconnect._send_command_str(
-                                    "show full-configuration"
-                                )
-
-                                for line in backup_config.splitlines():
-                                    log.write(line + "\n")
-                                print(backup_config)
-                        except Exception as e:
-                            print("Backup download failed:" + e)
-
-                        return (
-                            "https://" + str(ip) + " " + str(serial)
-                        )  # + str(MSOD_PASSWORD)
+                            # return "https://" + str(ip) + " " + str(serial) #+ str(MSOD_PASSWORD)
 
                     finally:
                         try:
